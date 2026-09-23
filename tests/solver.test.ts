@@ -183,6 +183,162 @@ test('随机对拍：动态规划与暴力枚举一致（90 组小规模）', ()
   }
 });
 
+test('高幅交替波形：第一层全部并列时第二层全零向量为唯一前两层最优解', () => {
+  // 50 个采样点：1e12 与 0 交替 25 组；核 [1,1]，上限单值 4 广播。
+  // 任意脉冲对相邻“高点/零点”产生等量反向的残差变化，故所有脉冲向量的第一层
+  // L1 恒为 25e12；第二层必须唯一选择脉冲总数 0 的全零向量。
+  const A = 1_000_000_000_000;
+  const y: number[] = [];
+  for (let g = 0; g < 25; g++) {
+    y.push(A);
+    y.push(0);
+  }
+  const h = [1, 1];
+  const n = 49;
+  const r = solve({ y, h, u: new Array(n).fill(4) });
+  // 两层目标
+  assert.equal(r.l1, 25 * A);
+  assert.equal(r.pulses, 0);
+  // 规范向量
+  assert.deepEqual(r.x, new Array(n).fill(0));
+  // 重建全零、有符号残差与观测一致
+  assert.deepEqual(r.recon, new Array(50).fill(0));
+  assert.deepEqual(r.resid, y);
+  // 49 个位置的精确计数集合全部为 {0}
+  assert.equal(r.sets.length, n);
+  for (let j = 0; j < n; j++) assert.deepEqual(r.sets[j], [0], `位置 ${j} 计数集合应为 {0}`);
+  // 同优位置数为 0
+  assert.deepEqual(r.tied, []);
+});
+
+test('高幅波形：第二层脉冲总数决胜不被大数值吞没', () => {
+  // 25 组 [3S, S] 对拼成 50 个采样点，核 [S, S]，上限单值 4 广播。
+  // 每组内 x 取 1/2/3 时第一层 L1 同为 2S，第二层只允许计数 1：取值 2、3、4
+  // 对应的脉冲数多 1 以上，旧实现的浮点容差
+  // （约 4·EPSILON·L1·scoreWeight ≈ 2.6）会把它们误并入同优集合，本测试予以拦截。
+  // 同时该结构在相邻组之间存在真正的前两层同优（{1,0,1} 与 {0,1,1} 等），
+  // 真实的 {0,1} 二值集合必须完整保留。S=3e11 时所有输入（含核）≤ 页面上限 1e12。
+  const S = 300_000_000_000;
+  const y: number[] = [];
+  for (let g = 0; g < 25; g++) {
+    y.push(3 * S);
+    y.push(S);
+  }
+  const h = [S, S];
+  const n = 49;
+  const r = solve({ y, h, u: new Array(n).fill(4) });
+  assert.equal(r.l1, 50 * S);
+  assert.equal(r.pulses, 25);
+  // 规范解：相邻组共享一个脉冲，字典序最小的安排为 [0,1,0,1,…,0,1,1]
+  const canonical = Array.from({ length: n }, (_, j) => (j === n - 1 || j % 2 === 1 ? 1 : 0));
+  assert.deepEqual(r.x, canonical);
+  // 精确计数集合：前 48 个位置 {0,1}（真实同优），末位置 {1}；任何集合都不得含 2/3/4
+  const expectedSets = Array.from({ length: n }, (_, j) => (j === n - 1 ? [1] : [0, 1]));
+  assert.deepEqual(r.sets, expectedSets);
+  assert.deepEqual(
+    r.tied,
+    Array.from({ length: n - 1 }, (_, j) => j),
+  );
+  // 结构孪生（幅值归一）经暴力枚举确认上述重复模式：2 对（u=4）与 3 对（u=3）
+  const makeTwin = (pairs: number, uMax: number): Problem => ({
+    y: Array.from({ length: 2 * pairs }, (_, t) => (t % 2 === 0 ? 3 : 1)),
+    h: [1, 1],
+    u: new Array(2 * pairs - 1).fill(uMax),
+  });
+  assert.deepEqual(brute(makeTwin(2, 4)).sets, [[0, 1], [0, 1], [1]]);
+  assert.deepEqual(brute(makeTwin(3, 3)).sets, [[0, 1], [0, 1], [0, 1], [0, 1], [1]]);
+  // 重建与残差逐项核对
+  assert.deepEqual(r.recon, convolve(canonical, h, 50));
+  assert.deepEqual(r.resid, y.map((v, t) => v - r.recon[t]));
+});
+
+test('高幅波形：真正的前两层同优解在大数值下仍保持集合完整', () => {
+  // 普通幅值内置示例 [2,2,1,0,…]、核 [1,1] 的整体等比放大（观测与核同乘 S）：
+  // {x0=2} 与 {x0=1,x1=1} 同为 (L1=S, 脉冲=2)，位置 0 集合 {1,2}、
+  // 位置 1 集合 {0,1} 必须在大数值下完整保留——精确整数重写不得把真实同优
+  // 误判为非平凡外的任何形态（高幅值下“误并”一侧由前两个用例拦截）。
+  // S=5e11 时所有输入（含核项 2S）均不超过页面接受上限 1e12。
+  const S = 500_000_000_000;
+  const y = [2 * S, 2 * S, S, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  const h = [S, S];
+  const r = solve({ y, h, u: new Array(11).fill(2) });
+  assert.equal(r.l1, S);
+  assert.equal(r.pulses, 2);
+  assert.deepEqual(r.x, [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+  assert.deepEqual(r.sets[0], [1, 2]);
+  assert.deepEqual(r.sets[1], [0, 1]);
+  for (let j = 2; j < 11; j++) assert.deepEqual(r.sets[j], [0]);
+  assert.deepEqual(r.tied, [0, 1]);
+});
+
+test('高幅交替波形：非均匀上限下计数集合仍精确', () => {
+  const A = 1_000_000_000_000;
+  const y: number[] = [];
+  for (let g = 0; g < 25; g++) {
+    y.push(A);
+    y.push(0);
+  }
+  const n = 49;
+  // 偶数位置上限 4、奇数位置上限 0（被封死的位置集合只能为 {0}）
+  const u = Array.from({ length: n }, (_, j) => (j % 2 === 0 ? 4 : 0));
+  const r = solve({ y, h: [1, 1], u });
+  assert.equal(r.l1, 25 * A);
+  assert.equal(r.pulses, 0);
+  assert.deepEqual(r.x, new Array(n).fill(0));
+  for (let j = 0; j < n; j++) assert.deepEqual(r.sets[j], [0], `位置 ${j} 计数集合应为 {0}`);
+  assert.deepEqual(r.tied, []);
+});
+
+test('可穷举小规模：枚举全部 y/h/u 组合与暴力枚举对拍全部集合', () => {
+  // 不依赖随机抽样：对小规模问题穷举观测波形、响应核与非均匀上限的全部组合，
+  // 逐项核对两层目标、规范解与每个位置的精确计数集合（含核内零与 u=0 封死）。
+  const cartesian = (alphabet: number[], len: number): number[][] => {
+    const out: number[][] = [[]];
+    for (let d = 0; d < len; d++) {
+      const size = out.length;
+      for (let q = 0; q < size; q++) {
+        const base = out[q];
+        for (let v = 1; v < alphabet.length; v++) out.push([...base, alphabet[v]]);
+        out[q] = [...base, alphabet[0]];
+      }
+    }
+    return out;
+  };
+  const configs: Array<{ m: number; h: number[]; yAlphabet: number[]; uAlphabet: number[] }> = [
+    // n = m−k+1 = 5：上限 32 种、波形 3^6 种、4 个核
+    { m: 6, h: [1, 1], yAlphabet: [0, 1, 2], uAlphabet: [0, 1] },
+    { m: 6, h: [2, 1], yAlphabet: [0, 1, 2], uAlphabet: [0, 1] },
+    { m: 6, h: [1, 2], yAlphabet: [0, 1, 2], uAlphabet: [0, 1] },
+    { m: 6, h: [3, 1], yAlphabet: [0, 1, 2], uAlphabet: [0, 1] },
+    // n = 4：核内零权重、首尾为正
+    { m: 6, h: [1, 0, 1], yAlphabet: [0, 1], uAlphabet: [0, 1] },
+    { m: 6, h: [1, 1, 1], yAlphabet: [0, 1], uAlphabet: [0, 1] },
+    { m: 6, h: [2, 0, 1], yAlphabet: [0, 1], uAlphabet: [0, 1] },
+    // n = 3：非均匀上限取值 0..2 全部枚举
+    { m: 5, h: [1, 0, 1], yAlphabet: [0, 1, 2], uAlphabet: [0, 1, 2] },
+    { m: 5, h: [1, 1, 1], yAlphabet: [0, 1, 2], uAlphabet: [0, 1, 2] },
+  ];
+  let count = 0;
+  for (const cfg of configs) {
+    const n = cfg.m - cfg.h.length + 1;
+    const ys = cartesian(cfg.yAlphabet, cfg.m);
+    const us = cartesian(cfg.uAlphabet, n);
+    for (const y of ys) {
+      for (const u of us) {
+        const p: Problem = { y, h: cfg.h, u };
+        const got = solve(p);
+        const want = brute(p);
+        assert.equal(got.l1, want.bestL, `L1 不一致：${JSON.stringify(p)}`);
+        assert.equal(got.pulses, want.bestC, `脉冲数不一致：${JSON.stringify(p)}`);
+        assert.deepEqual(got.x, want.canonical, `规范解不一致：${JSON.stringify(p)}`);
+        assert.deepEqual(got.sets, want.sets, `计数集合不一致：${JSON.stringify(p)}`);
+        count++;
+      }
+    }
+  }
+  assert.ok(count > 100_000, `穷举用例数异常：${count}`);
+});
+
 test('规模冒烟：m=300、k=7、u=4 上限规模可解', () => {
   const r = rng(7);
   const p = randProblem(r, 300, 7, 4);

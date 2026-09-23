@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { validateProblem, LIMITS } from '../src/parse.js';
+import { solve } from '../src/solver.js';
 
 const GOOD_Y = '2, 2, 1, 0, 1, 2, 1, 0, 0, 0, 0, 0';
 const GOOD_H = '1, 1';
@@ -86,4 +87,23 @@ test('输入校验：取值上限守护精确整数运算', () => {
   const v = validateProblem(`${big}, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0`, GOOD_H, GOOD_U);
   assert.equal(v.problem, null);
   assert.match(v.errors.find((e) => e.field === 'waveform')?.message ?? '', /超出允许范围/);
+});
+
+test('端到端：1e12 与 0 交替 50 点的页面录入通过校验，且仅有全零一个前两层最优解', () => {
+  // 页面已接受的非负整数（单值 1e12，恰为上限，未收紧任何数值范围）必须继续合法；
+  // 求解器对该高幅交替波形只应得到一个前两层最优解：全零向量。
+  const rawY = Array.from({ length: 50 }, (_, i) => (i % 2 === 0 ? '1000000000000' : '0')).join(', ');
+  const v = validateProblem(rawY, '1, 1', '4');
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.problem);
+  assert.deepEqual(v.counts, { m: 50, k: 2, n: 49, uCount: 1 });
+  assert.ok(v.problem.u.every((x) => x === 4));
+  const r = solve(v.problem);
+  assert.equal(r.l1, 25_000_000_000_000);
+  assert.equal(r.pulses, 0);
+  assert.deepEqual(r.x, new Array(49).fill(0));
+  assert.deepEqual(r.recon, new Array(50).fill(0));
+  assert.deepEqual(r.resid, v.problem.y);
+  for (const s of r.sets) assert.deepEqual(s, [0]);
+  assert.deepEqual(r.tied, []);
 });
