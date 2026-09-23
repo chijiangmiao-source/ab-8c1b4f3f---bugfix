@@ -12,11 +12,15 @@
 // 同时为每个位置 j 给出前两层全部全局最优（同优）解中 x[j] 可取的精确计数集合。
 //
 // 算法：残差 r_t 只依赖 x[t−k+1..t]，故以最近 k−1 个脉冲值为状态做动态规划。
+// 代价始终按 (L1, 脉冲数) 整数对保存，按字典序精确比较，不做任何浮点容差近似：
+// 若把两层代价打包成单个浮点数（如 L1·权重 + 脉冲数），高幅输入下相对容差会
+// 大于 1，把脉冲数不同的解误判为同优；而打包值本身还可能超过 2^53 失去精确性。
 // 反向递推得到每个状态到结尾的最优代价 B，正向扫描得到到达每个状态的最优代价 F，
 // 位置 j 取值 v 可行于某全局同优解 ⟺ 存在状态 s 使
-//   F[j][s] + 步代价(s,v) + B[j+1][shift(s,v)] == 全局最优（按 (L1, 脉冲数) 字典序比较）。
-// 规范解则在保持该等式的前提下逐位取最小 v。所有量均为非负整数，
-// 在输入取值不超过 1e9 时 L1 总和远低于 2^53，Float64 整数运算精确无舍入。
+//   F[j][s] + 步代价(s,v) + B[j+1][shift(s,v)] == 全局最优（两层分量分别相等）。
+// 规范解则在保持该等式的前提下逐位取最小 v。所有量均为非负整数：
+// 输入取值不超过 1e12 时 L1 ≤ 300·(7·4·1e12) < 2^53，脉冲数 ≤ 300·4，
+// Float64 整数运算精确无舍入。
 
 export interface Problem {
   /** 观测波形，长度 m ∈ [12, 300]，非负整数 */
@@ -72,11 +76,6 @@ export function solve(problem: Problem): SolveResult {
   if (n < 1 || u.length !== n) {
     throw new Error(`维度不一致：m=${m}, k=${k}, 需要 |u|=n=${n}，实际 |u|=${u.length}`);
   }
-  const scoreWeight = 1 + u.reduce((sum, limit) => sum + limit, 0);
-  const sameScore = (left: number, right: number) => {
-    const scale = Math.max(1, Math.abs(left), Math.abs(right));
-    return Math.abs(left - right) <= Number.EPSILON * scale * 4;
-  };
 
   // 第 j 步（选择 x[j]）之前的状态窗口为 x[j−k+1 .. j−1]，共 k−1 个槽位；
   // 越界槽位取值恒为 0（基数 1），合法槽位基数为 u[p]+1。
@@ -94,14 +93,16 @@ export function solve(problem: Problem): SolveResult {
     sizes[j] = s;
   }
 
-  // 反向动态规划：B[j][s] = 在第 j 步前处于状态 s 时，从第 j 步到结束的最优 (L1, 脉冲数)。
-  const bScore: Float64Array[] = new Array(n + 1);
+  // 反向动态规划：B[j][s] = 在第 j 步前处于状态 s 时，从第 j 步到结束的最优代价，
+  // 以 (bL1[j][s], bCnt[j][s]) 整数对保存，按 (L1, 脉冲数) 字典序比较。
+  const bL1: Float64Array[] = new Array(n + 1);
+  const bCnt: Float64Array[] = new Array(n + 1);
 
   // 终止层 j = n：尾部残差 t = n .. m−1 完全由窗口 x[n−k+1 .. n−1] 决定（越界 x = 0）。
   {
     const sn = sizes[n];
     const r = radix[n];
-    const score = new Float64Array(sn);
+    const l1 = new Float64Array(sn);
     const w = new Array<number>(k - 1);
     for (let idx = 0; idx < sn; idx++) {
       let rem = idx;
@@ -118,9 +119,10 @@ export function solve(problem: Problem): SolveResult {
         const rr = y[n + s] - acc;
         sum += rr < 0 ? -rr : rr;
       }
-      score[idx] = sum * scoreWeight;
+      l1[idx] = sum;
     }
-    bScore[n] = score;
+    bL1[n] = l1;
+    bCnt[n] = new Float64Array(sn); // 终止层不再产生脉冲
   }
 
   for (let j = n - 1; j >= 0; j--) {
@@ -130,8 +132,10 @@ export function solve(problem: Problem): SolveResult {
     const uj = u[j];
     // 状态转移：去掉窗口最低位 w0，左移后追加 v；next = base + v·top
     const top = sizes[j + 1] / (uj + 1);
-    const nextScore = bScore[j + 1];
-    const score = new Float64Array(sj);
+    const nextL1 = bL1[j + 1];
+    const nextCnt = bCnt[j + 1];
+    const l1 = new Float64Array(sj);
+    const cnt = new Float64Array(sj);
     const yj = y[j];
     const h0 = h[0];
     for (let idx = 0; idx < sj; idx++) {
@@ -146,27 +150,36 @@ export function solve(problem: Problem): SolveResult {
         rem = (rem - d) / r[i];
         dot += h[k - 1 - i] * d;
       }
-      let bestScore = Infinity;
+      let bestL1 = Infinity;
+      let bestC = Infinity;
       for (let v = 0; v <= uj; v++) {
         const rr = yj - (dot + h0 * v);
         const a = rr < 0 ? -rr : rr;
         const ni = base + v * top;
-        const candidate = a * scoreWeight + v + nextScore[ni];
-        if (candidate < bestScore) bestScore = candidate;
+        const candL1 = a + nextL1[ni];
+        const candC = v + nextCnt[ni];
+        if (candL1 < bestL1 || (candL1 === bestL1 && candC < bestC)) {
+          bestL1 = candL1;
+          bestC = candC;
+        }
       }
-      score[idx] = bestScore;
+      l1[idx] = bestL1;
+      cnt[idx] = bestC;
     }
-    bScore[j] = score;
+    bL1[j] = l1;
+    bCnt[j] = cnt;
   }
 
-  const optScore = bScore[0][0];
+  const optL1 = bL1[0][0];
+  const optCnt = bCnt[0][0];
 
-  // 正向扫描：F[j][s] = 到达第 j 步状态 s 的最优前缀代价；
-  // 同时用 F + 步代价 + B == 全局最优 判定每个位置的可取计数集合，
+  // 正向扫描：F[j][s] = 到达第 j 步状态 s 的最优前缀代价 (fL1, fCnt)；
+  // 同时用 F + 步代价 + B == 全局最优（两层分量分别相等）判定每个位置的可取计数集合，
   // 并在保持全局最优的前提下逐位取最小 v 构造规范解。
   const sets: number[][] = new Array(n);
   const x = new Array<number>(n).fill(0);
-  let fScore = new Float64Array(sizes[0]);
+  let fL1 = new Float64Array(sizes[0]);
+  let fCnt = new Float64Array(sizes[0]);
   let cur = 0;
   for (let j = 0; j < n; j++) {
     const sj = sizes[j];
@@ -174,14 +187,17 @@ export function solve(problem: Problem): SolveResult {
     const r0 = r[0];
     const uj = u[j];
     const top = sizes[j + 1] / (uj + 1);
-    const nextScore = bScore[j + 1];
-    const gScore = new Float64Array(sizes[j + 1]).fill(Infinity);
+    const nextL1 = bL1[j + 1];
+    const nextCnt = bCnt[j + 1];
+    const gL1 = new Float64Array(sizes[j + 1]).fill(Infinity);
+    const gCnt = new Float64Array(sizes[j + 1]);
     const yj = y[j];
     const h0 = h[0];
     const setJ: number[] = [];
     for (let idx = 0; idx < sj; idx++) {
-      const prefixScore = fScore[idx];
-      if (prefixScore === Infinity) continue;
+      const prefixL1 = fL1[idx];
+      if (prefixL1 === Infinity) continue;
+      const prefixCnt = fCnt[idx];
       const w0 = idx % r0;
       const base = (idx - w0) / r0;
       let rem = base;
@@ -195,9 +211,17 @@ export function solve(problem: Problem): SolveResult {
         const rr = yj - (dot + h0 * v);
         const a = rr < 0 ? -rr : rr;
         const ni = base + v * top;
-        const candidate = prefixScore + a * scoreWeight + v;
-        if (candidate < gScore[ni]) gScore[ni] = candidate;
-        if (sameScore(candidate + nextScore[ni], optScore) && !setJ.includes(v)) {
+        const candL1 = prefixL1 + a;
+        const candCnt = prefixCnt + v;
+        if (candL1 < gL1[ni] || (candL1 === gL1[ni] && candCnt < gCnt[ni])) {
+          gL1[ni] = candL1;
+          gCnt[ni] = candCnt;
+        }
+        if (
+          candL1 + nextL1[ni] === optL1 &&
+          candCnt + nextCnt[ni] === optCnt &&
+          !setJ.includes(v)
+        ) {
           setJ.push(v);
         }
       }
@@ -205,7 +229,8 @@ export function solve(problem: Problem): SolveResult {
     // 规范解：当前状态必在某条全局同优路径上，取保持全局最优的最小 v
     {
       const idx = cur;
-      const prefixScore = fScore[idx];
+      const prefixL1 = fL1[idx];
+      const prefixCnt = fCnt[idx];
       const w0 = idx % r0;
       const base = (idx - w0) / r0;
       let rem = base;
@@ -220,7 +245,7 @@ export function solve(problem: Problem): SolveResult {
         const rr = yj - (dot + h0 * v);
         const a = rr < 0 ? -rr : rr;
         const ni = base + v * top;
-        if (sameScore(prefixScore + a * scoreWeight + v + nextScore[ni], optScore)) {
+        if (prefixL1 + a + nextL1[ni] === optL1 && prefixCnt + v + nextCnt[ni] === optCnt) {
           chosen = v;
           cur = ni;
           break;
@@ -230,7 +255,8 @@ export function solve(problem: Problem): SolveResult {
       x[j] = chosen;
     }
     sets[j] = setJ.sort((a, b) => a - b);
-    fScore = gScore;
+    fL1 = gL1;
+    fCnt = gCnt;
   }
 
   const recon = convolve(x, h, m);

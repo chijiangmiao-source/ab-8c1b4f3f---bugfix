@@ -87,3 +87,15 @@ test('输入校验：取值上限守护精确整数运算', () => {
   assert.equal(v.problem, null);
   assert.match(v.errors.find((e) => e.field === 'waveform')?.message ?? '', /超出允许范围/);
 });
+
+test('输入校验：1e12 高幅值保持合法（不得收紧数值范围）', () => {
+  const rawY = Array.from({ length: 50 }, (_, t) =>
+    t % 2 === 0 ? '1000000000000' : '0',
+  ).join(', ');
+  const v = validateProblem(rawY, '1, 1', '4');
+  assert.deepEqual(v.errors, []);
+  assert.ok(v.problem);
+  assert.equal(v.problem.y.length, 50);
+  assert.equal(v.problem.u.length, 49);
+  assert.ok(v.problem.u.every((x) => x === 4));
+});
